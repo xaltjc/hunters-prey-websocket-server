@@ -13,8 +13,17 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// WebSocket Server
-const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+// Use Render's assigned port
+const PORT = process.env.PORT || 3000;
+
+// Start HTTP server
+const server = app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`WebSocket available at wss://your-domain.onrender.com`);
+});
+
+// WebSocket Server - attached to the same HTTP server
+const wss = new WebSocket.Server({ server });
 
 // Game state management
 const games = new Map();
@@ -450,26 +459,21 @@ setInterval(() => {
     }
 }, 5 * 60 * 1000);
 
-// Start HTTP server
-const HTTP_PORT = process.env.PORT || 3000;
-app.listen(HTTP_PORT, () => {
-    console.log(`HTTP server running on port ${HTTP_PORT}`);
-});
-
-console.log('WebSocket server running on port 8080');
-console.log('Use wss://your-domain.com:8080 for secure connections');
-
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down gracefully');
     wss.close(() => {
-        process.exit(0);
+        server.close(() => {
+            process.exit(0);
+        });
     });
 });
 
 process.on('SIGINT', () => {
     console.log('SIGINT received, shutting down gracefully');
     wss.close(() => {
-        process.exit(0);
+        server.close(() => {
+            process.exit(0);
+        });
     });
 });
