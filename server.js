@@ -37,6 +37,8 @@ class Game {
         this.players = new Map();
         this.isActive = false;
         this.startTime = null;
+        this.createdAt = Date.now(); // Add creation timestamp
+        this.name = null; // Add game name property
         this.perimeter = {
             centerLat: null,
             centerLon: null,
@@ -164,6 +166,9 @@ function handleMessage(playerId, message) {
         case 'join_game':
             handleJoinGame(playerId, payload);
             break;
+        case 'get_active_games':
+            handleGetActiveGames(playerId);
+            break;
         case 'leave_game':
             handleLeaveGame(playerId);
             break;
@@ -187,13 +192,59 @@ function handleMessage(playerId, message) {
     }
 }
 
+// Get active games handler
+function handleGetActiveGames(playerId) {
+    const ws = players.get(playerId);
+    if (!ws) return;
+
+    const activeGames = [];
+    
+    for (const game of games.values()) {
+        // Only include games that are waiting for players (not started yet)
+        if (!game.isActive && game.players.size > 0) {
+            activeGames.push({
+                id: game.id,
+                name: game.name || `Game-${game.id.slice(0, 8)}`, // Use stored game name
+                creator: Array.from(game.players.values()).find(p => p.id === game.creatorId)?.name || 'Unknown',
+                players: game.players.size,
+                maxPlayers: 8, // Fixed max for now
+                status: 'waiting',
+                created: getTimeAgo(game.createdAt || Date.now()),
+                hasPassword: Boolean(game.password)
+            });
+        }
+    }
+
+    ws.send(JSON.stringify({
+        type: 'active_games',
+        payload: { games: activeGames }
+    }));
+}
+
+// Helper function to get time ago string
+function getTimeAgo(timestamp) {
+    const now = Date.now();
+    const diff = now - timestamp;
+    const minutes = Math.floor(diff / (1000 * 60));
+    
+    if (minutes < 1) return 'Just now';
+    if (minutes < 60) return `${minutes} min ago`;
+    
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours} hour${hours > 1 ? 's' : ''} ago`;
+    
+    const days = Math.floor(hours / 24);
+    return `${days} day${days > 1 ? 's' : ''} ago`;
+}
+
 // Create game handler
 function handleCreateGame(playerId, payload) {
-    const { password, perimeterRadius, playerRole } = payload;
+    const { password, perimeterRadius, playerRole, gameName } = payload;
     const gameId = uuidv4();
     
     const game = new Game(gameId, password, playerId);
     game.perimeter.radius = perimeterRadius || 1000;
+    game.name = gameName || `Game-${gameId.slice(0, 8)}`; // Store game name
     
     games.set(gameId, game);
     
