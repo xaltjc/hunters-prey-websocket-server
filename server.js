@@ -207,7 +207,7 @@ function handleGetActiveGames(playerId) {
                 name: game.name || `Game-${game.id.slice(0, 8)}`, // Use stored game name
                 creator: Array.from(game.players.values()).find(p => p.id === game.creatorId)?.name || 'Unknown',
                 players: game.players.size,
-                maxPlayers: 8, // Fixed max for now
+                maxPlayers: 20, // Increased from 8 to 20
                 status: 'waiting',
                 created: getTimeAgo(game.createdAt || Date.now()),
                 hasPassword: Boolean(game.password)
