@@ -10,7 +10,12 @@ app.use(express.json());
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        activeGames: games.size,
+        connectedPlayers: players.size
+    });
 });
 
 // Use Render's assigned port
@@ -37,8 +42,10 @@ class Game {
         this.players = new Map();
         this.isActive = false;
         this.startTime = null;
-        this.createdAt = Date.now(); // Add creation timestamp
-        this.name = null; // Add game name property
+        this.createdAt = Date.now();
+        this.name = null;
+        this.boundary = null;
+        this.startingPoint = null;
         this.perimeter = {
             centerLat: null,
             centerLon: null,
@@ -178,6 +185,9 @@ function handleMessage(playerId, message) {
         case 'location_update':
             handleLocationUpdate(playerId, payload);
             break;
+        case 'prey_caught':
+            handlePreyCaught(playerId, payload);
+            break;
         case 'role_change':
             handleRoleChange(playerId, payload);
             break;
@@ -239,12 +249,13 @@ function getTimeAgo(timestamp) {
 
 // Create game handler
 function handleCreateGame(playerId, payload) {
-    const { password, perimeterRadius, playerRole, gameName } = payload;
+    const { password, playerRole, gameName, boundary, startingPoint } = payload;
     const gameId = uuidv4();
     
     const game = new Game(gameId, password, playerId);
-    game.perimeter.radius = perimeterRadius || 1000;
-    game.name = gameName || `Game-${gameId.slice(0, 8)}`; // Store game name
+    game.name = gameName || `Game-${gameId.slice(0, 8)}`;
+    game.boundary = boundary || null;
+    game.startingPoint = startingPoint || null;
     
     games.set(gameId, game);
     
@@ -261,7 +272,8 @@ function handleCreateGame(playerId, payload) {
             game: {
                 id: gameId,
                 isActive: game.isActive,
-                perimeter: game.perimeter,
+                boundary: game.boundary,
+                startingPoint: game.startingPoint,
                 players: Array.from(game.players.values())
             }
         }
@@ -274,25 +286,36 @@ function handleCreateGame(playerId, payload) {
 function handleJoinGame(playerId, payload) {
     const { password, playerRole, gameId } = payload;
     
-    // Find game by password (simplified - in production, use proper game lookup)
     let targetGame = null;
     if (gameId) {
         targetGame = games.get(gameId);
-    } else {
-        // Find by password
-        for (const game of games.values()) {
-            if (game.password === password) {
-                targetGame = game;
-                break;
-            }
-        }
     }
 
     if (!targetGame) {
         const ws = players.get(playerId);
         ws.send(JSON.stringify({
             type: 'error',
-            payload: { message: 'Game not found or invalid password' }
+            payload: { message: 'Game not found' }
+        }));
+        return;
+    }
+
+    // Validate password
+    if (targetGame.password && targetGame.password !== password) {
+        const ws = players.get(playerId);
+        ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'Invalid password' }
+        }));
+        return;
+    }
+
+    // Enforce only one prey per game
+    if (playerRole === 'prey' && targetGame.getActivePreyPlayers().length > 0) {
+        const ws = players.get(playerId);
+        ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'Prey role is already taken. Please join as a Hunter.' }
         }));
         return;
     }
@@ -310,7 +333,8 @@ function handleJoinGame(playerId, payload) {
             game: {
                 id: targetGame.id,
                 isActive: targetGame.isActive,
-                perimeter: targetGame.perimeter,
+                boundary: targetGame.boundary,
+                startingPoint: targetGame.startingPoint,
                 players: Array.from(targetGame.players.values())
             }
         }
@@ -423,6 +447,41 @@ function handleLocationUpdate(playerId, payload) {
     console.log(`Location update from ${playerId} in game ${game.id}: ${lat}, ${lon}`);
 }
 
+// Prey caught handler
+function handlePreyCaught(playerId, payload) {
+    const game = findPlayerGame(playerId);
+    if (!game) return;
+
+    const { hunterId, hunterName, location, timestamp } = payload;
+    const player = game.players.get(playerId);
+    
+    if (!player || player.role !== 'hunter') {
+        console.log('Prey caught attempt by non-hunter player:', playerId);
+        return;
+    }
+
+    console.log(`Prey caught by hunter ${playerId} in game ${game.id}`);
+
+    // Broadcast prey caught to all players in the game
+    game.broadcast({
+        type: 'prey_caught',
+        payload: {
+            hunterId: playerId,
+            hunterName: player.name || 'Hunter',
+            location: location,
+            timestamp: timestamp || Date.now()
+        }
+    });
+
+    // Update game state - mark as prey caught
+    game.preyCaught = {
+        hunterId: playerId,
+        hunterName: player.name || 'Hunter',
+        location: location,
+        timestamp: timestamp || Date.now()
+    };
+}
+
 // Role change handler
 function handleRoleChange(playerId, payload) {
     const game = findPlayerGame(playerId);
@@ -509,6 +568,16 @@ setInterval(() => {
         }
     }
 }, 5 * 60 * 1000);
+
+// Self-ping every 4 minutes to prevent Render spin-down while players are connected
+setInterval(() => {
+    if (players.size > 0) {
+        const url = `http://localhost:${PORT}/health`;
+        require('http').get(url, (res) => {
+            console.log(`Self-ping: ${players.size} players, ${games.size} games`);
+        }).on('error', () => {});
+    }
+}, 4 * 60 * 1000);
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
