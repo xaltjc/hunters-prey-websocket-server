@@ -115,7 +115,6 @@ class Player {
 // WebSocket connection handler
 wss.on('connection', (ws) => {
     const playerId = uuidv4();
-    const player = new Player(ws, playerId);
     players.set(playerId, ws);
     
     console.log(`Player ${playerId} connected`);
@@ -141,7 +140,17 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         console.log(`Player ${playerId} disconnected`);
-        handlePlayerDisconnect(playerId);
+        // Don't immediately remove from game — allow rejoin within grace period
+        const game = findPlayerGame(playerId);
+        if (game) {
+            const player = game.players.get(playerId);
+            if (player) {
+                player.disconnectedAt = Date.now();
+                player.disconnected = true;
+                console.log(`Player ${playerId} marked as disconnected in game ${game.id}`);
+                broadcastLobbyUpdate(game);
+            }
+        }
         players.delete(playerId);
     });
 
@@ -172,6 +181,9 @@ function handleMessage(playerId, message) {
             break;
         case 'join_game':
             handleJoinGame(playerId, payload);
+            break;
+        case 'rejoin_game':
+            handleRejoinGame(playerId, payload);
             break;
         case 'get_active_games':
             handleGetActiveGames(playerId);
@@ -352,6 +364,89 @@ function handleJoinGame(playerId, payload) {
     broadcastLobbyUpdate(targetGame);
 
     console.log(`Player ${playerId} joined game ${targetGame.id}`);
+}
+
+// Rejoin game handler — swap WebSocket for a disconnected player
+function handleRejoinGame(playerId, payload) {
+    const { gameId, password, oldPlayerId } = payload;
+    
+    const game = games.get(gameId);
+    if (!game) {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({ type: 'error', payload: { message: 'Game not found' } }));
+        return;
+    }
+
+    // Validate password
+    if (game.password && game.password !== password) {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({ type: 'error', payload: { message: 'Invalid password' } }));
+        return;
+    }
+
+    // Find the disconnected player in this game
+    const oldPlayer = game.players.get(oldPlayerId);
+    if (!oldPlayer || !oldPlayer.disconnected) {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({ type: 'error', payload: { message: 'No disconnected session found. Try joining as new player.' } }));
+        return;
+    }
+
+    // Grace period: 10 minutes to rejoin
+    if (Date.now() - oldPlayer.disconnectedAt > 10 * 60 * 1000) {
+        game.removePlayer(oldPlayerId);
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({ type: 'error', payload: { message: 'Session expired. Please rejoin as a new player.' } }));
+        return;
+    }
+
+    // Swap: remove old player entry, re-add under new playerId with same data
+    const savedRole = oldPlayer.role;
+    const savedRoleLocked = oldPlayer.roleLocked;
+    const savedName = oldPlayer.name;
+
+    game.removePlayer(oldPlayerId);
+    game.addPlayer(playerId, {
+        role: savedRole,
+        name: savedName
+    });
+    const newPlayer = game.players.get(playerId);
+    if (newPlayer) {
+        newPlayer.roleLocked = savedRoleLocked;
+    }
+
+    // Update the new WebSocket reference
+    players.set(playerId, players.get(playerId));
+
+    // If this was the creator, update creatorId
+    if (game.creatorId === oldPlayerId) {
+        game.creatorId = playerId;
+    }
+
+    const ws = players.get(playerId);
+    ws.send(JSON.stringify({
+        type: 'rejoin_success',
+        payload: {
+            gameId: game.id,
+            isCreator: game.creatorId === playerId,
+            role: savedRole,
+            roleLocked: savedRoleLocked,
+            isActive: game.isActive,
+            startTime: game.startTime,
+            game: {
+                id: game.id,
+                name: game.name,
+                isActive: game.isActive,
+                boundary: game.boundary,
+                startingPoint: game.startingPoint,
+                creatorId: game.creatorId,
+                players: Array.from(game.players.values())
+            }
+        }
+    }));
+
+    broadcastLobbyUpdate(game);
+    console.log(`Player ${playerId} rejoined game ${game.id} (was ${oldPlayerId})`);
 }
 
 // Leave game handler
@@ -600,12 +695,9 @@ function handleSetPerimeter(playerId, payload) {
     console.log(`Perimeter updated for game ${game.id}`);
 }
 
-// Player disconnect handler
+// Player disconnect handler — no longer removes immediately, grace period handled on close
 function handlePlayerDisconnect(playerId) {
-    const game = findPlayerGame(playerId);
-    if (game) {
-        handleLeaveGame(playerId);
-    }
+    // Handled in ws.on('close') — player stays in game as disconnected
 }
 
 // Helper function to find game by player ID
@@ -622,12 +714,32 @@ function findPlayerGame(playerId) {
 setInterval(() => {
     const now = Date.now();
     const maxInactiveTime = 30 * 60 * 1000; // 30 minutes
+    const rejoinGracePeriod = 10 * 60 * 1000; // 10 minutes
 
     for (const [gameId, game] of games.entries()) {
+        // Clean up expired disconnected players
+        for (const [playerId, player] of game.players.entries()) {
+            if (player.disconnected && now - player.disconnectedAt > rejoinGracePeriod) {
+                console.log(`Removing expired disconnected player ${playerId} from game ${gameId}`);
+                game.removePlayer(playerId);
+                // If creator expired, end the game
+                if (game.creatorId === playerId) {
+                    game.broadcast({
+                        type: 'game_ended',
+                        payload: { reason: 'Host disconnected and did not return' }
+                    });
+                    games.delete(gameId);
+                    break;
+                }
+            }
+        }
+
+        if (!games.has(gameId)) continue;
+
         let hasActivePlayers = false;
         
         for (const [playerId, player] of game.players.entries()) {
-            if (now - player.lastSeen < maxInactiveTime) {
+            if (!player.disconnected && now - player.lastSeen < maxInactiveTime) {
                 hasActivePlayers = true;
                 break;
             }
