@@ -496,7 +496,17 @@ function broadcastLobbyUpdate(game) {
 // Start game handler
 function handleStartGame(playerId, payload) {
     const game = findPlayerGame(playerId);
-    if (!game) return;
+    if (!game) {
+        console.log(`start_game: player ${playerId} not found in any game`);
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'You are not in a game. Please create or join a game first.' }
+        }));
+        return;
+    }
+
+    console.log(`start_game: player ${playerId}, creator: ${game.creatorId}, match: ${game.creatorId === playerId}`);
 
     if (game.creatorId !== playerId) {
         const ws = players.get(playerId);
@@ -618,7 +628,15 @@ function handlePreyCaught(playerId, payload) {
 // Role change handler
 function handleRoleChange(playerId, payload) {
     const game = findPlayerGame(playerId);
-    if (!game) return;
+    if (!game) {
+        console.log(`role_change: player ${playerId} not found in any game`);
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'You are not in a game.' }
+        }));
+        return;
+    }
 
     const { newRole } = payload;
     const player = game.players.get(playerId);
