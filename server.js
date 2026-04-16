@@ -249,7 +249,7 @@ function getTimeAgo(timestamp) {
 
 // Create game handler
 function handleCreateGame(playerId, payload) {
-    const { password, playerRole, gameName, boundary, startingPoint } = payload;
+    const { password, gameName, boundary, startingPoint } = payload;
     const gameId = uuidv4();
     
     const game = new Game(gameId, password, playerId);
@@ -259,8 +259,9 @@ function handleCreateGame(playerId, payload) {
     
     games.set(gameId, game);
     
+    // Player joins lobby with no role yet
     game.addPlayer(playerId, {
-        role: playerRole || 'prey',
+        role: null,
         name: payload.playerName || `Player-${playerId.slice(0, 6)}`
     });
 
@@ -269,11 +270,14 @@ function handleCreateGame(playerId, payload) {
         type: 'game_created',
         payload: {
             gameId,
+            isCreator: true,
             game: {
                 id: gameId,
+                name: game.name,
                 isActive: game.isActive,
                 boundary: game.boundary,
                 startingPoint: game.startingPoint,
+                creatorId: game.creatorId,
                 players: Array.from(game.players.values())
             }
         }
@@ -284,7 +288,7 @@ function handleCreateGame(playerId, payload) {
 
 // Join game handler
 function handleJoinGame(playerId, payload) {
-    const { password, playerRole, gameId } = payload;
+    const { password, gameId } = payload;
     
     let targetGame = null;
     if (gameId) {
@@ -300,6 +304,16 @@ function handleJoinGame(playerId, payload) {
         return;
     }
 
+    // Don't allow joining started games
+    if (targetGame.isActive) {
+        const ws = players.get(playerId);
+        ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'Game has already started' }
+        }));
+        return;
+    }
+
     // Validate password
     if (targetGame.password && targetGame.password !== password) {
         const ws = players.get(playerId);
@@ -310,18 +324,9 @@ function handleJoinGame(playerId, payload) {
         return;
     }
 
-    // Enforce only one prey per game
-    if (playerRole === 'prey' && targetGame.getActivePreyPlayers().length > 0) {
-        const ws = players.get(playerId);
-        ws.send(JSON.stringify({
-            type: 'error',
-            payload: { message: 'Prey role is already taken. Please join as a Hunter.' }
-        }));
-        return;
-    }
-
+    // Player joins lobby with no role yet
     targetGame.addPlayer(playerId, {
-        role: playerRole || 'hunter',
+        role: null,
         name: payload.playerName || `Player-${playerId.slice(0, 6)}`
     });
 
@@ -330,25 +335,21 @@ function handleJoinGame(playerId, payload) {
         type: 'game_joined',
         payload: {
             gameId: targetGame.id,
+            isCreator: false,
             game: {
                 id: targetGame.id,
+                name: targetGame.name,
                 isActive: targetGame.isActive,
                 boundary: targetGame.boundary,
                 startingPoint: targetGame.startingPoint,
+                creatorId: targetGame.creatorId,
                 players: Array.from(targetGame.players.values())
             }
         }
     }));
 
-    // Broadcast to other players
-    targetGame.broadcast({
-        type: 'player_joined',
-        payload: {
-            playerId,
-            playerName: payload.playerName || `Player-${playerId.slice(0, 6)}`,
-            role: playerRole || 'hunter'
-        }
-    }, playerId);
+    // Broadcast updated lobby to all players
+    broadcastLobbyUpdate(targetGame);
 
     console.log(`Player ${playerId} joined game ${targetGame.id}`);
 }
@@ -361,15 +362,6 @@ function handleLeaveGame(playerId) {
     const player = game.players.get(playerId);
     game.removePlayer(playerId);
 
-    // Broadcast to remaining players
-    game.broadcast({
-        type: 'player_left',
-        payload: {
-            playerId,
-            playerName: player ? player.name : 'Unknown'
-        }
-    });
-
     // If game creator left, end the game
     if (game.creatorId === playerId) {
         game.broadcast({
@@ -377,9 +369,33 @@ function handleLeaveGame(playerId) {
             payload: { reason: 'Host left the game' }
         });
         games.delete(game.id);
+    } else {
+        // Broadcast updated lobby to remaining players
+        broadcastLobbyUpdate(game);
     }
 
     console.log(`Player ${playerId} left game ${game.id}`);
+}
+
+// Broadcast lobby state to all players in the game
+function broadcastLobbyUpdate(game) {
+    const playerList = Array.from(game.players.values());
+    const allReady = playerList.length > 0 && playerList.every(p => p.role && p.roleLocked);
+
+    // Send to all players in the game
+    game.players.forEach((player, pid) => {
+        const ws = players.get(pid);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'lobby_update',
+                payload: {
+                    players: playerList,
+                    allReady,
+                    creatorId: game.creatorId
+                }
+            }));
+        }
+    });
 }
 
 // Start game handler
@@ -396,6 +412,27 @@ function handleStartGame(playerId, payload) {
         return;
     }
 
+    // Check all players have selected and locked roles
+    const allReady = Array.from(game.players.values()).every(p => p.role && p.roleLocked);
+    if (!allReady) {
+        const ws = players.get(playerId);
+        ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'All players must select a role before starting' }
+        }));
+        return;
+    }
+
+    // Ensure there is exactly one prey
+    if (game.getActivePreyPlayers().length !== 1) {
+        const ws = players.get(playerId);
+        ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'There must be exactly one Prey to start the game' }
+        }));
+        return;
+    }
+
     game.isActive = true;
     game.startTime = Date.now();
 
@@ -403,7 +440,8 @@ function handleStartGame(playerId, payload) {
         type: 'game_started',
         payload: {
             startTime: game.startTime,
-            perimeter: game.perimeter
+            perimeter: game.perimeter,
+            players: Array.from(game.players.values())
         }
     });
 
@@ -489,19 +527,52 @@ function handleRoleChange(playerId, payload) {
 
     const { newRole } = payload;
     const player = game.players.get(playerId);
-    
-    if (player) {
-        player.role = newRole;
-        
-        game.broadcast({
-            type: 'role_changed',
-            payload: {
-                playerId,
-                newRole,
-                playerName: player.name
-            }
-        });
+    if (!player) return;
+
+    // Don't allow role changes once game is started
+    if (game.isActive) {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'Cannot change role after game has started' }
+        }));
+        return;
     }
+
+    // Don't allow role changes once locked
+    if (player.roleLocked) {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'Your role is already locked' }
+        }));
+        return;
+    }
+
+    // Enforce only one prey
+    if (newRole === 'prey' && game.getActivePreyPlayers().length > 0) {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: 'Prey role is already taken. Please select Hunter.' }
+        }));
+        return;
+    }
+
+    player.role = newRole;
+    player.roleLocked = true;
+
+    // Confirm to the selecting player
+    const ws = players.get(playerId);
+    if (ws) ws.send(JSON.stringify({
+        type: 'role_confirmed',
+        payload: { role: newRole, locked: true }
+    }));
+
+    // Broadcast updated lobby to all
+    broadcastLobbyUpdate(game);
+
+    console.log(`Player ${playerId} selected role: ${newRole} (locked)`);
 }
 
 // Set perimeter handler
