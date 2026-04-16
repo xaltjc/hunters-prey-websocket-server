@@ -541,6 +541,35 @@ function handleStartGame(playerId, payload) {
     game.isActive = true;
     game.startTime = Date.now();
 
+    // Start 2-hour auto-win timer for prey
+    const GAME_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours
+    game.autoWinTimer = setTimeout(() => {
+        if (!game.isActive) return;
+
+        const preyPlayer = game.getActivePreyPlayers()[0];
+        const preyName = preyPlayer ? preyPlayer.name || 'Prey' : 'Prey';
+        const duration = Date.now() - game.startTime;
+
+        console.log(`Game ${game.id} auto-win: prey survived ${GAME_DURATION_MS / 60000} minutes`);
+
+        game.isActive = false;
+        game.broadcast({
+            type: 'game_ended',
+            payload: {
+                winner: 'prey',
+                preyName: preyName,
+                duration: duration,
+                reason: `${preyName} survived for 2 hours and wins!`
+            }
+        });
+
+        // Clean up game
+        setTimeout(() => {
+            games.delete(game.id);
+            console.log(`Game ${game.id} removed after auto-win`);
+        }, 5000);
+    }, GAME_DURATION_MS);
+
     game.broadcast({
         type: 'game_started',
         payload: {
@@ -590,39 +619,54 @@ function handleLocationUpdate(playerId, payload) {
     console.log(`Location update from ${playerId} in game ${game.id}: ${lat}, ${lon}`);
 }
 
-// Prey caught handler
+// Prey caught handler — only prey can declare they were caught
 function handlePreyCaught(playerId, payload) {
     const game = findPlayerGame(playerId);
-    if (!game) return;
-
-    const { hunterId, hunterName, location, timestamp } = payload;
-    const player = game.players.get(playerId);
-    
-    if (!player || player.role !== 'hunter') {
-        console.log('Prey caught attempt by non-hunter player:', playerId);
+    if (!game) {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({ type: 'error', payload: { message: 'You are not in a game.' } }));
         return;
     }
 
-    console.log(`Prey caught by hunter ${playerId} in game ${game.id}`);
+    const player = game.players.get(playerId);
+    if (!player || player.role !== 'prey') {
+        const ws = players.get(playerId);
+        if (ws) ws.send(JSON.stringify({ type: 'error', payload: { message: 'Only the prey can declare they were caught.' } }));
+        return;
+    }
 
-    // Broadcast prey caught to all players in the game
+    const { hunterId, hunterName, location, timestamp } = payload;
+    const preyName = player.name || 'Prey';
+    const duration = game.startTime ? Date.now() - game.startTime : 0;
+
+    console.log(`Prey ${playerId} caught by hunter ${hunterId} in game ${game.id}`);
+
+    // Clear auto-win timer
+    if (game.autoWinTimer) {
+        clearTimeout(game.autoWinTimer);
+        game.autoWinTimer = null;
+    }
+
+    // End the game — broadcast game_ended to ALL players
+    game.isActive = false;
     game.broadcast({
-        type: 'prey_caught',
+        type: 'game_ended',
         payload: {
-            hunterId: playerId,
-            hunterName: player.name || 'Hunter',
+            winner: 'hunter',
+            hunterId: hunterId,
+            hunterName: hunterName || 'Hunter',
+            preyName: preyName,
             location: location,
-            timestamp: timestamp || Date.now()
+            duration: duration,
+            reason: `${hunterName || 'A hunter'} caught ${preyName}!`
         }
     });
 
-    // Update game state - mark as prey caught
-    game.preyCaught = {
-        hunterId: playerId,
-        hunterName: player.name || 'Hunter',
-        location: location,
-        timestamp: timestamp || Date.now()
-    };
+    // Clean up game after a short delay
+    setTimeout(() => {
+        games.delete(game.id);
+        console.log(`Game ${game.id} removed after prey caught`);
+    }, 5000);
 }
 
 // Role change handler
